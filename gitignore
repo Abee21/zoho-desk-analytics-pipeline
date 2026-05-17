@@ -1,0 +1,24 @@
+# Credentials — NEVER commit these
+service_account.json
+*.json
+!n8n_zoho_sync_workflow.json
+
+# Data files — too large and sensitive for GitHub
+*.csv
+*.parquet
+archive/
+
+# Python environment
+zoho_env/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log

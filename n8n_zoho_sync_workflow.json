@@ -1,0 +1,200 @@
+{
+  "name": "Zoho Desk → Google Sheets + Drive Archive (Daily Sync)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "hours", "hoursInterval": 24 }]
+        }
+      },
+      "name": "⏰ Daily Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300],
+      "notes": "Runs every day at midnight. Change 'hoursInterval' to run more often."
+    },
+    {
+      "parameters": {
+        "url": "https://desk.zoho.com/api/v1/tickets",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "orgId", "value": "={{$vars.ZOHO_ORG_ID}}" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "limit", "value": "100" },
+            { "name": "from", "value": "={{ $now.minus(1, 'day').startOf('day').toISO() }}" },
+            { "name": "to",   "value": "={{ $now.startOf('day').toISO() }}" },
+            { "name": "sortBy", "value": "createdTime" },
+            { "name": "fields", "value": "id,ticketNumber,subject,status,priority,channel,departmentId,assigneeId,createdTime,closedTime,responseTime,resolutionTime,customerResponseTime,slaId,isOverDue,cf" }
+          ]
+        }
+      },
+      "name": "📥 Fetch Yesterday Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 300],
+      "notes": "Fetches tickets created yesterday. Pagination handled by the 'Loop' node below."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Flatten and clean each ticket for storage\nconst raw = $input.all();\nconst tickets = raw[0].json.data || [];\n\nreturn tickets.map(t => {\n  const created = new Date(t.createdTime);\n  const closed  = t.closedTime ? new Date(t.closedTime) : null;\n  const resolutionHours = closed\n    ? ((closed - created) / 36e5).toFixed(2)\n    : null;\n\n  return {\n    json: {\n      ticket_id:          t.id,\n      ticket_number:      t.ticketNumber,\n      subject:            t.subject,\n      status:             t.status,\n      priority:           t.priority,\n      channel:            t.channel,\n      department_id:      t.departmentId,\n      assignee_id:        t.assigneeId,\n      created_date:       created.toISOString().split('T')[0],\n      created_time:       t.createdTime,\n      closed_time:        t.closedTime || '',\n      resolution_hours:   resolutionHours,\n      first_response_time: t.responseTime || '',\n      is_overdue:         t.isOverDue ? 'Yes' : 'No',\n      sla_id:             t.slaId || '',\n      sync_date:          new Date().toISOString().split('T')[0]\n    }\n  };\n});"
+      },
+      "name": "🔧 Transform Tickets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300],
+      "notes": "Cleans and flattens the Zoho API response into flat rows."
+    },
+    {
+      "parameters": {
+        "resource": "spreadsheet",
+        "operation": "appendOrUpdate",
+        "documentId": { "value": "={{$vars.GOOGLE_SHEET_ID}}" },
+        "sheetName": { "value": "raw_tickets" },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "matchingColumns": ["ticket_id"]
+        }
+      },
+      "name": "📊 Write to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [900, 200],
+      "notes": "Appends new tickets. Uses ticket_id as dedup key so re-runs don't create duplicates."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check if any rows in the Sheet are older than 365 days\n// This node just sets the threshold date as a variable\nconst cutoff = new Date();\ncutoff.setFullYear(cutoff.getFullYear() - 1);\nreturn [{ json: { archive_cutoff: cutoff.toISOString().split('T')[0] } }];"
+      },
+      "name": "📅 Set Archive Cutoff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 420],
+      "notes": "Calculates the 12-month cutoff date. Rows older than this will be archived to Drive."
+    },
+    {
+      "parameters": {
+        "resource": "spreadsheet",
+        "operation": "readRows",
+        "documentId": { "value": "={{$vars.GOOGLE_SHEET_ID}}" },
+        "sheetName": { "value": "raw_tickets" },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "created_date",
+              "condition": "before",
+              "lookupValue": "={{ $('📅 Set Archive Cutoff').item.json.archive_cutoff }}"
+            }
+          ]
+        }
+      },
+      "name": "📤 Read Old Rows",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [1120, 420],
+      "notes": "Reads rows from Sheets that are older than 12 months. These will be archived."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "id": "has-old-rows",
+              "leftValue": "={{ $input.all().length }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ]
+        }
+      },
+      "name": "❓ Any Old Rows?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1340, 420],
+      "notes": "Only proceeds to archive if there are rows older than 12 months."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Convert old rows to CSV string (Parquet conversion happens in Python)\n// n8n sends this CSV to Drive; Python converts to Parquet separately\nconst rows = $input.all().map(i => i.json);\nif (!rows.length) return [];\n\nconst headers = Object.keys(rows[0]);\nconst csv = [\n  headers.join(','),\n  ...rows.map(r =>\n    headers.map(h => {\n      const v = String(r[h] ?? '').replace(/\"/g, '\"\"');\n      return v.includes(',') || v.includes('\\n') || v.includes('\"') ? `\"${v}\"` : v;\n    }).join(',')\n  )\n].join('\\n');\n\nconst year = rows[0].created_date.substring(0, 4);\nreturn [{ json: { csv_content: csv, archive_year: year, filename: `zoho_tickets_${year}.csv` } }];"
+      },
+      "name": "📦 Build Archive CSV",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 380],
+      "notes": "Converts old rows to CSV. Python script will convert this to Parquet on your machine."
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "upload",
+        "name": "={{ $json.filename }}",
+        "driveId": { "value": "myDrive" },
+        "folderId": { "value": "={{$vars.DRIVE_ARCHIVE_FOLDER_ID}}" },
+        "binaryData": false,
+        "content": "={{ $json.csv_content }}",
+        "mimeType": "text/csv"
+      },
+      "name": "☁️ Upload to Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [1780, 380],
+      "notes": "Saves the old data as a CSV to your archive folder in Drive. Python converts to Parquet."
+    },
+    {
+      "parameters": {
+        "resource": "spreadsheet",
+        "operation": "deleteRows",
+        "documentId": { "value": "={{$vars.GOOGLE_SHEET_ID}}" },
+        "sheetName": { "value": "raw_tickets" },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "created_date",
+              "condition": "before",
+              "lookupValue": "={{ $('📅 Set Archive Cutoff').item.json.archive_cutoff }}"
+            }
+          ]
+        }
+      },
+      "name": "🗑️ Remove Archived Rows",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [2000, 380],
+      "notes": "Deletes rows from Sheets AFTER confirming upload to Drive succeeded."
+    }
+  ],
+  "connections": {
+    "⏰ Daily Trigger":           { "main": [[{ "node": "📥 Fetch Yesterday Tickets", "type": "main", "index": 0 }]] },
+    "📥 Fetch Yesterday Tickets": { "main": [[{ "node": "🔧 Transform Tickets", "type": "main", "index": 0 }]] },
+    "🔧 Transform Tickets":       { "main": [[{ "node": "📊 Write to Google Sheets", "type": "main", "index": 0 }, { "node": "📅 Set Archive Cutoff", "type": "main", "index": 0 }]] },
+    "📅 Set Archive Cutoff":      { "main": [[{ "node": "📤 Read Old Rows", "type": "main", "index": 0 }]] },
+    "📤 Read Old Rows":           { "main": [[{ "node": "❓ Any Old Rows?", "type": "main", "index": 0 }]] },
+    "❓ Any Old Rows?":           { "main": [[{ "node": "📦 Build Archive CSV", "type": "main", "index": 0 }], []] },
+    "📦 Build Archive CSV":       { "main": [[{ "node": "☁️ Upload to Drive", "type": "main", "index": 0 }]] },
+    "☁️ Upload to Drive":         { "main": [[{ "node": "🗑️ Remove Archived Rows", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "variables": {
+    "ZOHO_ORG_ID":             "YOUR_ZOHO_ORG_ID",
+    "GOOGLE_SHEET_ID":         "1jfeqntRgPpQmY49r9YaRlgTzXI5vP9QsUuW-BXj131Y",
+    "DRIVE_ARCHIVE_FOLDER_ID": "1oMY6Qkt9s8GBeE1VnHlCvpznY7ek7h05"
+  },
+  "_instructions": {
+    "step1": "In n8n → Credentials: Add 'Zoho OAuth2' and 'Google Sheets OAuth2' credentials",
+    "step2": "Set the 3 variables above in n8n → Settings → Variables",
+    "step3": "Import this JSON via n8n → Workflows → Import from file",
+    "step4": "Run manually once to test, then activate the schedule"
+  }
+}
